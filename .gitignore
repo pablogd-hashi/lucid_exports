@@ -1,0 +1,64 @@
+# Sensitive files - DO NOT COMMIT
+.env
+*.env
+.env.*
+
+# API keys and credentials
+*_api_key*
+*_token*
+*_secret*
+
+# Checkpoint files (contain document IDs)
+.export_checkpoint.json
+.final_checkpoint.json
+.auto_checkpoint.json
+.profile_checkpoint.json
+.playwright_checkpoint.json
+
+# Log files
+*.log
+*_log.txt
+export_log.txt
+final_export_log.txt
+auto_export_log.txt
+profile_export_log.txt
+playwright_export_log.txt
+
+# Exported files
+lucid_exports/
+exports/
+*.vsdx
+*.png
+*.pdf
+
+# Temporary files
+.tmp/
+.temp_downloads/
+temp/
+tmp/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Playwright
+recorded_actions.py
+test-results/
+playwright-report/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
