@@ -88,12 +88,12 @@ exports/{folder_name}/
 
 ## Features
 
-✅ **Single Command** - No setup or configuration needed  
-✅ **Automatic Discovery** - Finds all documents in folder via browser  
-✅ **Personal & Team Folders** - Works with both  
-✅ **Progress Tracking** - Saves checkpoint every 5 documents  
-✅ **Resumable** - Continue after interruption  
-✅ **No API Required** - Pure browser automation  
+ **Single Command** - No setup or configuration needed  
+ **Automatic Discovery** - Finds all documents in folder via browser  
+ **Personal & Team Folders** - Works with both  
+ **Progress Tracking** - Saves checkpoint every 5 documents  
+ **Resumable** - Continue after interruption  
+ **No API Required** - Pure browser automation  
 
 ## Resume After Interruption
 
@@ -123,47 +123,3 @@ The script will:
 - Check `export_log.txt` for details
 - Run script again to retry failed documents
 
-## Sharing with Team
-
-Share these files:
-- `export_folder.py` - The export script
-- `README.md` - This documentation
-- `.env.example` - Environment template (optional)
-
-Team members need:
-1. Python 3.8+
-2. Playwright: `pip install playwright python-dotenv`
-3. Browser: `playwright install chromium`
-4. Access to the Lucid folder
-
-## Files
-
-- `export_folder.py` - Main export script
-- `README.md` - Documentation
-- `TEAM_USAGE.md` - Quick guide for team members
-- `README_SIMPLIFIED.md` - Alternative quick start
-- `.env` - Your API key (optional, for API-based discovery)
-- `.gitignore` - Protects sensitive files
-- `exports/` - Output directory (created automatically)
-- `venv/` - Python virtual environment
-
-## How It Works
-
-1. **Discovery**: Script navigates to folder and finds all document thumbnails
-2. **Extraction**: Extracts document IDs from thumbnail `data-test-id` attributes
-3. **Export**: For each document:
-   - Opens document in edit mode
-   - Clicks hamburger menu → Download → Visio (VSDX)
-   - Saves file with original name
-4. **Progress**: Saves checkpoint every 5 documents
-
-## Requirements
-
-- Python 3.8 or higher
-- Playwright library
-- Chromium browser (installed via Playwright)
-- Access to Lucid folder
-
-## License
-
-Utility script for personal/team use. Ensure compliance with Lucid terms of service.
