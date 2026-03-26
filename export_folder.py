@@ -176,7 +176,15 @@ def export_document(page, doc, output_dir: str):
     """
     doc_id = doc["id"]
     doc_name = doc["name"]
-    output_path = os.path.join(output_dir, f"{doc_name}.vsdx")
+    folder_path = doc.get("folder_path", "")
+    
+    # Create full output path with subfolder structure
+    if folder_path:
+        full_output_dir = os.path.join(output_dir, folder_path)
+        os.makedirs(full_output_dir, exist_ok=True)
+        output_path = os.path.join(full_output_dir, f"{doc_name}.vsdx")
+    else:
+        output_path = os.path.join(output_dir, f"{doc_name}.vsdx")
     
     try:
         # Navigate to document edit page
@@ -269,10 +277,115 @@ def extract_folder_id_and_url(input_str: str) -> tuple:
     folder_url = f"https://lucid.app/documents#/documents?folder_id={input_str}"
     return (input_str, folder_url)
 
-def get_documents_from_folder_api(folder_id: str):
+def get_folders_hierarchy_api():
+    """
+    Get all folders and build hierarchy using Lucid API.
+    Returns dict of {folder_id: {name, parent_id, path}} or None if fails.
+    """
+    api_key = os.getenv("LUCID_API_KEY")
+    if not api_key:
+        return None
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Lucid-Api-Version": API_VERSION,
+    }
+    
+    log(f"📡 Fetching folder hierarchy via API...")
+    
+    folders = {}
+    page = 1
+    
+    try:
+        while True:
+            url = f"{API_BASE_URL}/folders"
+            response = requests.get(
+                url,
+                headers=headers,
+                params={"page": page, "limit": 100},
+                timeout=30
+            )
+            
+            if response.status_code != 200:
+                log(f"⚠️  Folders API request failed: {response.status_code}")
+                log(f"   URL: {url}")
+                log(f"   Response: {response.text[:200]}")
+                return None
+            
+            data = response.json()
+            items = data.get("items", [])
+            
+            if not items:
+                break
+            
+            for folder in items:
+                folder_id = folder.get("id")
+                folder_name = folder.get("title", "Untitled")
+                parent_id = folder.get("parent", {}).get("id")
+                
+                folders[folder_id] = {
+                    "name": sanitize_filename(folder_name),
+                    "parent_id": parent_id,
+                    "path": None
+                }
+            
+            page += 1
+            
+            if not data.get("nextPageToken"):
+                break
+        
+        log(f"✅ Found {len(folders)} folders via API")
+        return folders
+        
+    except Exception as e:
+        log(f"⚠️  Folders API error: {str(e)}")
+        return None
+
+def build_folder_paths(folders, root_folder_id):
+    """Build full paths for folders based on parent relationships."""
+    if not folders:
+        return {}
+    
+    log("🗂️  Building folder hierarchy...")
+    
+    # Set root folder path
+    if root_folder_id in folders:
+        folders[root_folder_id]["path"] = ""
+    
+    # Multiple passes to resolve nested folders
+    max_iterations = 10
+    for iteration in range(max_iterations):
+        unresolved = False
+        for folder_id, folder_info in folders.items():
+            if folder_info["path"] is None:
+                parent_id = folder_info["parent_id"]
+                
+                # If parent is root folder
+                if parent_id == root_folder_id:
+                    folders[folder_id]["path"] = folder_info["name"]
+                # If parent exists and has path
+                elif parent_id in folders and folders[parent_id]["path"] is not None:
+                    parent_path = folders[parent_id]["path"]
+                    if parent_path:
+                        folders[folder_id]["path"] = f"{parent_path}/{folder_info['name']}"
+                    else:
+                        folders[folder_id]["path"] = folder_info["name"]
+                else:
+                    unresolved = True
+        
+        if not unresolved:
+            break
+    
+    # Count resolved folders
+    resolved = sum(1 for f in folders.values() if f["path"] is not None)
+    log(f"✅ Resolved {resolved}/{len(folders)} folder paths")
+    
+    return folders
+
+def get_documents_from_folder_api(folder_id: str, folders_hierarchy=None):
     """
     Get documents from a specific folder using Lucid API.
-    Returns list of {id, name} dictionaries.
+    Returns list of {id, name, folder_path} dictionaries.
     """
     api_key = os.getenv("LUCID_API_KEY")
     if not api_key:
@@ -292,7 +405,7 @@ def get_documents_from_folder_api(folder_id: str):
     
     try:
         while True:
-            # Get all documents and filter by folder
+            # Get all documents
             response = requests.get(
                 f"{API_BASE_URL}/documents",
                 headers=headers,
@@ -310,10 +423,44 @@ def get_documents_from_folder_api(folder_id: str):
             if not items:
                 break
             
-            # Filter documents by folder
+            # Process documents
             for doc in items:
                 doc_folder_id = doc.get("parent", {}).get("id")
+                
+                # Check if document is in target folder or subfolders
+                is_in_folder = False
+                folder_path = ""
+                
                 if str(doc_folder_id) == str(folder_id):
+                    is_in_folder = True
+                    folder_path = ""
+                elif folders_hierarchy and doc_folder_id in folders_hierarchy:
+                    # Check if this folder is a subfolder of target
+                    current_id = doc_folder_id
+                    path_parts = []
+                    
+                    for _ in range(20):  # Max depth
+                        if current_id not in folders_hierarchy:
+                            break
+                        
+                        folder_info = folders_hierarchy[current_id]
+                        
+                        if str(current_id) == str(folder_id):
+                            is_in_folder = True
+                            folder_path = "/".join(reversed(path_parts))
+                            break
+                        
+                        path_parts.append(folder_info["name"])
+                        parent_id = folder_info["parent_id"]
+                        
+                        if str(parent_id) == str(folder_id):
+                            is_in_folder = True
+                            folder_path = "/".join(reversed(path_parts))
+                            break
+                        
+                        current_id = parent_id
+                
+                if is_in_folder:
                     doc_id = doc.get("id")
                     doc_title = doc.get("title", "Untitled")
                     product = doc.get("product", "lucidchart")
@@ -321,7 +468,8 @@ def get_documents_from_folder_api(folder_id: str):
                     if product == "lucidchart":
                         documents.append({
                             "id": doc_id,
-                            "name": sanitize_filename(doc_title)
+                            "name": sanitize_filename(doc_title),
+                            "folder_path": folder_path
                         })
             
             page += 1
@@ -384,13 +532,25 @@ def main():
         log("Press ENTER when ready to discover documents...")
         input()
         
-        # Try API-based discovery first
-        documents = get_documents_from_folder_api(folder_id)
+        # Try API-based discovery first (with folder hierarchy)
+        api_key = os.getenv("LUCID_API_KEY")
+        if api_key:
+            log("\n📡 Attempting API-based discovery...")
+            folders_hierarchy = get_folders_hierarchy_api()
+            documents = get_documents_from_folder_api(folder_id, folders_hierarchy)
+        else:
+            log("\n⚠️  No LUCID_API_KEY found - using browser-based discovery")
+            documents = None
         
         # Fall back to browser-based discovery if API fails
         if not documents:
-            log("\n🌐 Trying browser-based discovery...")
+            if api_key:
+                log("\n🌐 API unavailable, using browser-based discovery...")
             documents = discover_documents_from_folder(page, folder_id, folder_url)
+            # Add empty folder_path for browser-discovered documents
+            for doc in documents:
+                if "folder_path" not in doc:
+                    doc["folder_path"] = ""
         
         if not documents:
             log("\n❌ No documents found in folder!")
@@ -420,9 +580,14 @@ def main():
         # Filter documents to process
         to_process = [doc for doc in documents if doc["id"] not in completed]
         
-        # Check for existing files
+        # Check for existing files (considering subfolder structure)
         for doc in to_process[:]:
-            output_path = os.path.join(output_dir, f"{doc['name']}.vsdx")
+            folder_path = doc.get("folder_path", "")
+            if folder_path:
+                output_path = os.path.join(output_dir, folder_path, f"{doc['name']}.vsdx")
+            else:
+                output_path = os.path.join(output_dir, f"{doc['name']}.vsdx")
+            
             if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
                 completed.add(doc["id"])
                 to_process.remove(doc)
@@ -441,7 +606,9 @@ def main():
         fail_count = 0
         
         for i, doc in enumerate(to_process, 1):
-            log(f"[{i}/{len(to_process)}] Exporting: {doc['name']}")
+            folder_path = doc.get("folder_path", "")
+            display_path = f"{folder_path}/{doc['name']}" if folder_path else doc['name']
+            log(f"[{i}/{len(to_process)}] Exporting: {display_path}")
             
             if export_document(page, doc, output_dir):
                 completed.add(doc["id"])
@@ -453,6 +620,7 @@ def main():
                 failed_docs[doc["id"]] = {
                     "id": doc["id"],
                     "name": doc["name"],
+                    "folder_path": folder_path,
                     "attempts": failed_docs.get(doc["id"], {}).get("attempts", 0) + 1
                 }
             

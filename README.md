@@ -20,23 +20,17 @@ pip install playwright python-dotenv requests
 playwright install chromium
 ```
 
-### 2. Get Lucid API Key
+### 2. Optional: Create .env File
 
-1. Go to https://lucid.app/users/settings#/api
-2. Generate an API key
-3. Copy the key
+The script works without any API key using browser-based discovery.
 
-### 3. Create .env File
-
-Create a `.env` file in the project root:
+If you want to experiment with API-based features (currently limited), create a `.env` file:
 
 ```bash
 LUCID_API_KEY=your-api-key-here
 ```
 
-Replace `your-api-key-here` with your actual API key from step 2.
-
-**Note:** The API key is used for faster document discovery. If not provided, the script falls back to browser-based discovery (slower but still works).
+**Note:** Lucid's REST API has limited endpoints available. The script primarily uses browser automation for reliable document discovery and export.
 
 ## Usage
 
@@ -45,11 +39,17 @@ Replace `your-api-key-here` with your actual API key from step 2.
 Open your Lucid folder in browser and copy the URL:
 
 **Personal Folder:**
+Example:
+
 ```
 https://lucid.app/documents#/documents?folder_id=386721887
+
 ```
 
 **Team Folder:**
+
+Example:
+
 ```
 https://lucid.app/documents#/teams/354992253?folder_id=suggestedTeamDocuments-354992253
 ```
@@ -80,17 +80,20 @@ Exported files are saved to:
 exports/{folder_name}/
   ├── Diagram1.vsdx
   ├── Diagram2.vsdx
-  └── ...
+  ├── Diagram3.vsdx
+  └── Diagram4.vsdx
 ```
+
+**Note:** All documents from the folder (including subfolders) are exported to a single directory. Subfolder structure is not preserved due to Lucid API limitations.
 
 ## Features
 
 ✅ **Single Command** - No setup or configuration needed  
-✅ **Automatic Discovery** - Finds all documents in folder  
+✅ **Automatic Discovery** - Finds all documents in folder via browser  
 ✅ **Personal & Team Folders** - Works with both  
 ✅ **Progress Tracking** - Saves checkpoint every 5 documents  
 ✅ **Resumable** - Continue after interruption  
-✅ **No API Key** - Uses browser authentication  
+✅ **No API Required** - Pure browser automation  
 
 ## Resume After Interruption
 
