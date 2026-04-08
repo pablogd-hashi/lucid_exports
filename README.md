@@ -65,6 +65,11 @@ Or just use the folder ID:
 ./export_folder.py 386721887
 ```
 
+For **team folders**, prefer the full Lucid folder URL instead of only the folder ID so the script keeps the correct team context:
+```bash
+./export_folder.py "https://lucid.app/documents#/teams/354992253?folder_id=suggestedTeamDocuments-354992253"
+```
+
 ### 3. Log In & Export
 
 1. Browser opens automatically
@@ -122,4 +127,3 @@ The script will:
 ### Export failures
 - Check `export_log.txt` for details
 - Run script again to retry failed documents
-

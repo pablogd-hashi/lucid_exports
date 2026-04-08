@@ -14,6 +14,7 @@ Get folder_id from Lucid URL: https://lucid.app/folder/{folder_id}
 
 import json
 import os
+import re
 import sys
 import time
 import requests
@@ -21,6 +22,7 @@ from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from urllib.parse import parse_qs, urlparse
 
 load_dotenv()
 
@@ -30,6 +32,23 @@ CHECKPOINT_FILE = "./.export_checkpoint.json"
 LOG_FILE = "./export_log.txt"
 API_BASE_URL = "https://api.lucid.co"
 API_VERSION = "1"
+DOCUMENT_ID_PATTERNS = (
+    re.compile(r"/lucidchart/([A-Za-z0-9_-]{8,})/edit"),
+    re.compile(r"/documents/thumb/([A-Za-z0-9_-]{8,})/"),
+)
+DOCUMENT_TITLE_KEYS = ("title", "name", "documentName", "docName")
+FOLDER_ID_KEYS = ("folderId", "folder_id")
+PARENT_KEYS = ("parentId", "parent_id")
+DOCUMENT_TYPE_KEYS = ("product", "documentType", "type", "kind")
+NETWORK_URL_KEYWORDS = (
+    "document",
+    "folder",
+    "graphql",
+    "search",
+    "browse",
+    "list",
+    "recent",
+)
 
 def log(message: str):
     """Log message to console and file."""
@@ -66,21 +85,374 @@ def save_checkpoint(checkpoint):
     with open(CHECKPOINT_FILE, 'w') as f:
         json.dump(checkpoint, f, indent=2)
 
+def extract_document_id(value: str):
+    """Extract a Lucid document ID from a URL or attribute value."""
+    if not value:
+        return None
+    
+    value = str(value).strip()
+    if re.fullmatch(r"[A-Za-z0-9_-]{8,}", value):
+        return value
+    
+    for pattern in DOCUMENT_ID_PATTERNS:
+        match = pattern.search(value)
+        if match:
+            return match.group(1)
+    
+    return None
+
+def page_matches_folder(page_url: str, folder_id: str) -> bool:
+    """Check whether the current page URL already points at the requested folder."""
+    if not page_url or not folder_id:
+        return False
+    
+    if f"folder_id={folder_id}" in page_url:
+        return True
+    
+    parsed = urlparse(page_url)
+    if folder_id in parse_qs(parsed.query).get("folder_id", []):
+        return True
+    
+    if parsed.fragment and "?" in parsed.fragment:
+        fragment_query = parsed.fragment.split("?", 1)[1]
+        if folder_id in parse_qs(fragment_query).get("folder_id", []):
+            return True
+    
+    return False
+
+def normalize_document_name(raw_name: str, doc_id: str) -> str:
+    """Convert discovered text into a usable document filename."""
+    if raw_name:
+        for line in (part.strip() for part in raw_name.splitlines()):
+            if not line:
+                continue
+            if len(line) > 200:
+                continue
+            if re.search(r"(share|menu|last modified|owned by|open details)", line, re.IGNORECASE):
+                continue
+            return sanitize_filename(line)
+    
+    return f"Document_{doc_id[:8]}"
+
+def looks_like_folder_page(page_url: str) -> bool:
+    """Require a documents/teams page instead of matching login redirects."""
+    if not page_url:
+        return False
+    lowered = page_url.lower()
+    return "lucid.app/documents" in lowered and "login" not in lowered
+
+def extract_text_field(data, keys):
+    """Return the first non-empty string found for a list of candidate keys."""
+    if not isinstance(data, dict):
+        return None
+    
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    
+    return None
+
+def extract_nested_id(value):
+    """Extract IDs from strings or nested dicts."""
+    if isinstance(value, dict):
+        return extract_text_field(value, ("id", "folderId", "folder_id"))
+    if isinstance(value, str):
+        return value.strip() or None
+    return None
+
+def extract_folder_id_from_item(item):
+    """Extract a folder/parent identifier from a network payload item."""
+    if not isinstance(item, dict):
+        return None
+    
+    direct = extract_text_field(item, FOLDER_ID_KEYS)
+    if direct:
+        return direct
+    
+    for parent_key in ("parent", "folder", "container"):
+        nested = extract_nested_id(item.get(parent_key))
+        if nested:
+            return nested
+    
+    return extract_text_field(item, PARENT_KEYS)
+
+def item_looks_like_document(item):
+    """Heuristic check whether a JSON object represents a Lucid document."""
+    if not isinstance(item, dict):
+        return False
+    
+    doc_id = extract_document_id(item.get("id"))
+    if not doc_id:
+        for key in ("documentId", "docId", "document_id", "doc_id", "url", "href"):
+            doc_id = extract_document_id(item.get(key))
+            if doc_id:
+                break
+    if not doc_id:
+        return False
+    
+    doc_type = extract_text_field(item, DOCUMENT_TYPE_KEYS)
+    if doc_type and "folder" in doc_type.lower():
+        return False
+    
+    title = extract_text_field(item, DOCUMENT_TITLE_KEYS)
+    folder_ref = extract_folder_id_from_item(item)
+    return bool(title or folder_ref or doc_type)
+
+def document_from_item(item, folder_id: str):
+    """Convert a network payload object into the local document shape."""
+    if not item_looks_like_document(item):
+        return None
+    
+    doc_id = extract_document_id(item.get("id"))
+    if not doc_id:
+        for key in ("documentId", "docId", "document_id", "doc_id", "url", "href"):
+            doc_id = extract_document_id(item.get(key))
+            if doc_id:
+                break
+    
+    if not doc_id:
+        return None
+    
+    item_folder_id = extract_folder_id_from_item(item)
+    if item_folder_id and str(item_folder_id) != str(folder_id):
+        return None
+    
+    doc_type = extract_text_field(item, DOCUMENT_TYPE_KEYS)
+    if doc_type and "chart" not in doc_type.lower() and "document" not in doc_type.lower():
+        return None
+    
+    raw_name = extract_text_field(item, DOCUMENT_TITLE_KEYS)
+    return {
+        "id": doc_id,
+        "name": normalize_document_name(raw_name, doc_id),
+    }
+
+def extract_documents_from_json_payload(payload, folder_id: str):
+    """Recursively scan a JSON payload for document entries in the target folder."""
+    documents = []
+    seen = set()
+    
+    def walk(node):
+        if isinstance(node, dict):
+            doc = document_from_item(node, folder_id)
+            if doc and doc["id"] not in seen:
+                seen.add(doc["id"])
+                documents.append(doc)
+            
+            for value in node.values():
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+    
+    walk(payload)
+    return documents
+
+def attach_network_document_collector(page, folder_id: str):
+    """Capture document metadata from Lucid network responses during folder loading."""
+    collected = {}
+    
+    def handle_response(response):
+        try:
+            if response.request.resource_type not in ("xhr", "fetch"):
+                return
+            
+            url = response.url.lower()
+            if not any(keyword in url for keyword in NETWORK_URL_KEYWORDS):
+                return
+            
+            headers = response.headers
+            content_type = headers.get("content-type", headers.get("Content-Type", "")).lower()
+            if "json" not in content_type:
+                return
+            
+            payload = response.json()
+            docs = extract_documents_from_json_payload(payload, folder_id)
+            if not docs:
+                return
+            
+            for doc in docs:
+                collected.setdefault(doc["id"], doc)
+            
+            log(f"  📡 Network discovery: {len(docs)} docs from {response.url[:120]}")
+        except Exception:
+            return
+    
+    page.on("response", handle_response)
+    return collected
+
+def log_page_diagnostics(page):
+    """Log lightweight diagnostics about the current folder page."""
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    
+    log(f"  Page title: {title or '(empty)'}")
+    
+    try:
+        frame_urls = [frame.url for frame in page.frames if frame.url and frame.url != page.url]
+        if frame_urls:
+            for frame_url in frame_urls[:5]:
+                log(f"  Frame URL: {frame_url}")
+    except Exception:
+        pass
+
+    try:
+        stats = page.evaluate("""
+        () => ({
+          anchors: document.querySelectorAll('a[href]').length,
+          buttons: document.querySelectorAll('button').length,
+          links: document.querySelectorAll('[role="link"]').length,
+          iframes: document.querySelectorAll('iframe').length,
+          testIds: document.querySelectorAll('[data-test-id]').length,
+          bodyText: (document.body && document.body.innerText ? document.body.innerText.slice(0, 400) : '')
+        })
+        """)
+        log(
+            "  DOM stats: "
+            f"anchors={stats.get('anchors', 0)}, "
+            f"buttons={stats.get('buttons', 0)}, "
+            f"role_links={stats.get('links', 0)}, "
+            f"iframes={stats.get('iframes', 0)}, "
+            f"test_ids={stats.get('testIds', 0)}"
+        )
+        body_text = (stats.get("bodyText") or "").replace("\n", " ").strip()
+        if body_text:
+            log(f"  Body text sample: {body_text[:200]}")
+    except Exception:
+        pass
+
+def collect_document_candidates(page):
+    """Scrape document cards/links from the currently loaded folder view."""
+    return page.evaluate("""
+    () => {
+      const selectors = [
+        'a[href]',
+        'button[data-test-id]',
+        '[role="link"]',
+        '[data-test-id]',
+        '[data-document-id]',
+        '[data-doc-id]'
+      ];
+
+      const elements = [];
+      const seenElements = new Set();
+      for (const selector of selectors) {
+        for (const element of document.querySelectorAll(selector)) {
+          if (!seenElements.has(element)) {
+            seenElements.add(element);
+            elements.push(element);
+          }
+        }
+      }
+
+      const getDocId = (value) => {
+        if (!value) return null;
+        const patterns = [
+          /\\/lucidchart\\/([A-Za-z0-9_-]{8,})\\/edit/i,
+          /\\/documents\\/thumb\\/([A-Za-z0-9_-]{8,})\\//i
+        ];
+        for (const pattern of patterns) {
+          const match = String(value).match(pattern);
+          if (match) return match[1];
+        }
+        return null;
+      };
+
+      const cleanText = (value) => {
+        if (!value) return null;
+        const lines = String(value)
+          .split('\\n')
+          .map((line) => line.trim())
+          .filter(Boolean);
+        return lines.find((line) => line.length < 200) || null;
+      };
+
+      const pickName = (element) => {
+        const candidates = [];
+        const pushValue = (value) => {
+          const cleaned = cleanText(value);
+          if (cleaned) candidates.push(cleaned);
+        };
+
+        pushValue(element.getAttribute('aria-label'));
+        pushValue(element.getAttribute('title'));
+        pushValue(element.innerText);
+        pushValue(element.textContent);
+
+        const container = element.closest('[role="row"], [role="gridcell"], li, article, a, button, div');
+        if (container) {
+          pushValue(container.getAttribute('aria-label'));
+          pushValue(container.getAttribute('title'));
+          pushValue(container.innerText);
+        }
+
+        const parent = element.parentElement;
+        if (parent) {
+          pushValue(parent.getAttribute('aria-label'));
+          pushValue(parent.getAttribute('title'));
+          pushValue(parent.innerText);
+        }
+
+        return candidates[0] || null;
+      };
+
+      const results = [];
+      const seenDocIds = new Set();
+
+      for (const element of elements) {
+        const values = [
+          element.href,
+          element.getAttribute('href'),
+          element.getAttribute('data-href'),
+          element.getAttribute('data-test-id'),
+          element.getAttribute('data-document-id'),
+          element.getAttribute('data-doc-id'),
+          element.getAttribute('data-id')
+        ];
+
+        let docId = null;
+        for (const value of values) {
+          docId = getDocId(value);
+          if (docId) break;
+        }
+
+        if (!docId || seenDocIds.has(docId)) continue;
+        seenDocIds.add(docId);
+
+        results.push({
+          id: docId,
+          name: pickName(element)
+        });
+      }
+
+      return results;
+    }
+    """)
+
 def discover_documents_from_folder(page, folder_id: str, folder_url: str = None):
     """
     Navigate to folder and discover all documents.
     Returns list of {id, name} dictionaries.
     """
     log(f"📂 Navigating to folder: {folder_id}")
+    network_documents = attach_network_document_collector(page, folder_id)
     
     # Use provided URL or construct default
     if not folder_url:
         folder_url = f"https://lucid.app/documents#/documents?folder_id={folder_id}"
     
-    page.goto(folder_url, wait_until="networkidle", timeout=30000)
+    if page_matches_folder(page.url, folder_id) and looks_like_folder_page(page.url):
+        log(f"  Using currently loaded page: {page.url}")
+    else:
+        log(f"  Opening folder URL: {folder_url}")
+        page.goto(folder_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_load_state("networkidle", timeout=30000)
     
     # Wait for page to load
-    page.wait_for_timeout(5000)
+    page.wait_for_timeout(3000)
     
     # Check if we're on a valid folder page
     if "login" in page.url.lower():
@@ -88,75 +460,51 @@ def discover_documents_from_folder(page, folder_id: str, folder_url: str = None)
         return None
     
     log("🔍 Discovering documents in folder...")
-    
-    # Wait longer for documents to load
-    page.wait_for_timeout(5000)
+    log(f"  Current page URL: {page.url}")
+    log_page_diagnostics(page)
     
     documents = []
     seen_ids = set()
+    previous_height = -1
     
-    # Lucid uses thumbnail images with data-test-id containing document IDs
-    # Pattern: [data-test-id="https://thumbs.lucid.app/documents/thumb/{doc_id}/..."]
-    log("  Looking for document thumbnails...")
-    
-    # Find all elements with data-test-id containing thumbnail URLs
-    all_elements = page.locator('[data-test-id*="thumbs.lucid.app/documents/thumb/"]').all()
-    
-    log(f"  Found {len(all_elements)} document thumbnails")
-    
-    for element in all_elements:
-        try:
-            test_id = element.get_attribute('data-test-id')
-            if not test_id or 'thumbs.lucid.app/documents/thumb/' not in test_id:
-                continue
+    for pass_num in range(1, 6):
+        page.wait_for_timeout(2000)
+        
+        if network_documents:
+            new_docs = 0
+            for doc in network_documents.values():
+                if doc["id"] in seen_ids:
+                    continue
+                seen_ids.add(doc["id"])
+                documents.append(doc)
+                new_docs += 1
             
-            # Extract document ID from thumbnail URL
-            # Format: https://thumbs.lucid.app/documents/thumb/{doc_id}/...
-            parts = test_id.split('/documents/thumb/')
-            if len(parts) < 2:
-                continue
-            
-            doc_id = parts[1].split('/')[0]
-            
-            if not doc_id or doc_id in seen_ids or len(doc_id) < 10:
+            if new_docs:
+                log(f"  Pass {pass_num}: added {new_docs} docs from network responses")
+        
+        candidates = collect_document_candidates(page)
+        log(f"  Pass {pass_num}: found {len(candidates)} document candidates")
+        
+        for candidate in candidates:
+            doc_id = extract_document_id(candidate.get("id"))
+            if not doc_id or doc_id in seen_ids:
                 continue
             
             seen_ids.add(doc_id)
-            
-            # Try to get document name from nearby text or aria-label
-            doc_name = None
-            
-            # Try parent element's aria-label or title
-            try:
-                parent = element.locator('xpath=..').first
-                doc_name = parent.get_attribute('aria-label') or parent.get_attribute('title')
-            except:
-                pass
-            
-            # Try to find text near the thumbnail
-            if not doc_name:
-                try:
-                    # Look for text in parent container
-                    parent = element.locator('xpath=../..').first
-                    text = parent.inner_text().strip()
-                    if text and len(text) < 200:
-                        doc_name = text.split('\n')[0]  # Take first line
-                except:
-                    pass
-            
-            if not doc_name or len(doc_name) < 1:
-                doc_name = f"Document_{doc_id[:8]}"
+            doc_name = normalize_document_name(candidate.get("name"), doc_id)
             
             log(f"  ✓ Found: {doc_name} (ID: {doc_id[:8]}...)")
-            
             documents.append({
                 "id": doc_id,
-                "name": sanitize_filename(doc_name)
+                "name": doc_name
             })
-            
-        except Exception as e:
-            log(f"  ⚠️  Error processing element: {str(e)[:50]}")
-            continue
+        
+        current_height = page.evaluate("document.body.scrollHeight")
+        if current_height == previous_height and documents:
+            break
+        
+        previous_height = current_height
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     
     log(f"✅ Discovered {len(documents)} documents")
     
