@@ -40,6 +40,7 @@ DOCUMENT_TITLE_KEYS = ("title", "name", "documentName", "docName")
 FOLDER_ID_KEYS = ("folderId", "folder_id")
 PARENT_KEYS = ("parentId", "parent_id")
 DOCUMENT_TYPE_KEYS = ("product", "documentType", "type", "kind")
+DOCUMENT_URL_KEYS = ("editUrl", "edit_url", "editorUrl", "editor_url", "url", "href")
 NETWORK_URL_KEYWORDS = (
     "document",
     "folder",
@@ -134,6 +135,12 @@ def normalize_document_name(raw_name: str, doc_id: str) -> str:
     
     return f"Document_{doc_id[:8]}"
 
+def normalize_product(value) -> str:
+    """Normalize product/type hints to a stable lowercase label."""
+    if isinstance(value, str) and value.strip():
+        return value.strip().lower()
+    return "unknown"
+
 def looks_like_folder_page(page_url: str) -> bool:
     """Require a documents/teams page instead of matching login redirects."""
     if not page_url:
@@ -177,9 +184,54 @@ def extract_folder_id_from_item(item):
     
     return extract_text_field(item, PARENT_KEYS)
 
-def item_looks_like_document(item):
+def extract_document_link(item, doc_id: str):
+    """Extract a plausible browser URL for a discovered document."""
+    if not isinstance(item, dict):
+        return None
+    
+    def normalize_url(value):
+        if not isinstance(value, str):
+            return None
+        
+        value = value.strip()
+        if not value or "lucid" not in value.lower():
+            return None
+        if doc_id and doc_id not in value:
+            return None
+        if any(part in value for part in ("/shareSettings", "/extended", "/shapeLibraries/", "/byDocIds", "/folderEntries")):
+            return None
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+        return None
+    
+    direct = extract_text_field(item, DOCUMENT_URL_KEYS)
+    normalized = normalize_url(direct)
+    if normalized:
+        return normalized
+    
+    for nested_key in ("links", "actions", "navigation", "_links"):
+        nested = item.get(nested_key)
+        if isinstance(nested, dict):
+            for value in nested.values():
+                normalized = normalize_url(value)
+                if normalized:
+                    return normalized
+    
+    return None
+
+def source_url_looks_like_folder_listing(source_url: str) -> bool:
+    """Return True when a network response URL is clearly returning folders, not documents."""
+    if not source_url:
+        return False
+    lowered = source_url.lower()
+    return "/folders" in lowered and "/documents/" not in lowered and "/documents?" not in lowered
+
+def item_looks_like_document(item, source_url: str = None):
     """Heuristic check whether a JSON object represents a Lucid document."""
     if not isinstance(item, dict):
+        return False
+    
+    if source_url_looks_like_folder_listing(source_url):
         return False
     
     doc_id = extract_document_id(item.get("id"))
@@ -197,11 +249,12 @@ def item_looks_like_document(item):
     
     title = extract_text_field(item, DOCUMENT_TITLE_KEYS)
     folder_ref = extract_folder_id_from_item(item)
-    return bool(title or folder_ref or doc_type)
+    edit_url = extract_document_link(item, doc_id)
+    return bool(title and (edit_url or folder_ref or doc_type))
 
-def document_from_item(item, folder_id: str):
+def document_from_item(item, folder_id: str, source_url: str = None):
     """Convert a network payload object into the local document shape."""
-    if not item_looks_like_document(item):
+    if not item_looks_like_document(item, source_url):
         return None
     
     doc_id = extract_document_id(item.get("id"))
@@ -223,19 +276,23 @@ def document_from_item(item, folder_id: str):
         return None
     
     raw_name = extract_text_field(item, DOCUMENT_TITLE_KEYS)
+    product = normalize_product(doc_type)
+    edit_url = extract_document_link(item, doc_id)
     return {
         "id": doc_id,
         "name": normalize_document_name(raw_name, doc_id),
+        "product": product,
+        "edit_url": edit_url,
     }
 
-def extract_documents_from_json_payload(payload, folder_id: str):
+def extract_documents_from_json_payload(payload, folder_id: str, source_url: str = None):
     """Recursively scan a JSON payload for document entries in the target folder."""
     documents = []
     seen = set()
     
     def walk(node):
         if isinstance(node, dict):
-            doc = document_from_item(node, folder_id)
+            doc = document_from_item(node, folder_id, source_url)
             if doc and doc["id"] not in seen:
                 seen.add(doc["id"])
                 documents.append(doc)
@@ -267,8 +324,11 @@ def attach_network_document_collector(page, folder_id: str):
             if "json" not in content_type:
                 return
             
+            if source_url_looks_like_folder_listing(response.url):
+                return
+            
             payload = response.json()
-            docs = extract_documents_from_json_payload(payload, folder_id)
+            docs = extract_documents_from_json_payload(payload, folder_id, response.url)
             if not docs:
                 return
             
@@ -424,7 +484,8 @@ def collect_document_candidates(page):
 
         results.push({
           id: docId,
-          name: pickName(element)
+          name: pickName(element),
+          url: element.href || element.getAttribute('href') || element.getAttribute('data-href')
         });
       }
 
@@ -496,7 +557,9 @@ def discover_documents_from_folder(page, folder_id: str, folder_url: str = None)
             log(f"  ✓ Found: {doc_name} (ID: {doc_id[:8]}...)")
             documents.append({
                 "id": doc_id,
-                "name": doc_name
+                "name": doc_name,
+                "product": "unknown",
+                "edit_url": candidate.get("url")
             })
         
         current_height = page.evaluate("document.body.scrollHeight")
@@ -517,6 +580,71 @@ def discover_documents_from_folder(page, folder_id: str, folder_url: str = None)
     
     return documents
 
+def get_page_text_sample(page) -> str:
+    """Extract a short body text snippet for diagnostics."""
+    try:
+        sample = page.evaluate(
+            "() => document.body && document.body.innerText ? document.body.innerText.slice(0, 300) : ''"
+        )
+        return sample.replace("\n", " ").strip()
+    except Exception:
+        return ""
+
+def page_looks_not_found(page) -> bool:
+    """Check whether the current page looks like a not-found or unavailable page."""
+    title = ""
+    try:
+        title = page.title().lower()
+    except Exception:
+        title = ""
+    
+    url = (page.url or "").lower()
+    body = get_page_text_sample(page).lower()
+    indicators = (
+        "page not found",
+        "not found",
+        "doesn't exist",
+        "isn't available",
+        "no longer exists",
+    )
+    haystack = " ".join((title, url, body))
+    return any(indicator in haystack for indicator in indicators)
+
+def log_export_page_context(page, prefix: str = "  "):
+    """Log the current export page state for failure diagnosis."""
+    try:
+        log(f"{prefix}Current export URL: {page.url}")
+    except Exception:
+        pass
+    
+    try:
+        log(f"{prefix}Current export title: {page.title() or '(empty)'}")
+    except Exception:
+        pass
+    
+    body_sample = get_page_text_sample(page)
+    if body_sample:
+        log(f"{prefix}Current export body: {body_sample[:200]}")
+
+def build_export_urls(doc) -> list:
+    """Build candidate browser URLs for exporting a document."""
+    doc_id = doc["id"]
+    product = normalize_product(doc.get("product"))
+    urls = []
+    
+    for value in (doc.get("edit_url"), doc.get("url")):
+        if isinstance(value, str) and value.strip():
+            candidate = value.strip()
+            if candidate not in urls:
+                urls.append(candidate)
+    
+    if product in ("lucidchart", "chart", "document", "unknown"):
+        fallback = f"https://lucid.app/lucidchart/{doc_id}/edit"
+        if fallback not in urls:
+            urls.append(fallback)
+    
+    return urls
+
 def export_document(page, doc, output_dir: str):
     """
     Export a single document to VSDX format.
@@ -535,61 +663,82 @@ def export_document(page, doc, output_dir: str):
         output_path = os.path.join(output_dir, f"{doc_name}.vsdx")
     
     try:
-        # Navigate to document edit page
-        edit_url = f"https://lucid.app/lucidchart/{doc_id}/edit"
-        page.goto(edit_url, wait_until="networkidle", timeout=45000)
+        product = normalize_product(doc.get("product"))
+        candidate_urls = build_export_urls(doc)
         
-        # Wait for document to load
-        page.wait_for_selector("canvas, svg", timeout=15000)
-        page.wait_for_timeout(5000)
-        
-        # Check if redirected to login
-        if "login" in page.url.lower():
-            log(f"  ⚠️  Session expired, need to re-login")
+        if not candidate_urls:
+            log(f"  ⚠️  No export URL available for {doc_name} (product: {product})")
             return False
         
-        # Click hamburger menu
-        hamburger = page.locator('[data-test-id="header-hamburger-menu"] [data-test-id="menu-trigger-button"]')
-        hamburger.wait_for(state="visible", timeout=15000)
-        hamburger.click(timeout=10000)
-        page.wait_for_timeout(2000)
+        last_timeout_stage = "unknown"
+        for edit_url in candidate_urls:
+            try:
+                log(f"  → Opening export URL: {edit_url}")
+                last_timeout_stage = "navigation"
+                page.goto(edit_url, wait_until="domcontentloaded", timeout=30000)
+                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_timeout(2000)
+                
+                if "login" in page.url.lower():
+                    log(f"  ⚠️  Session expired, need to re-login")
+                    return False
+                
+                if page_looks_not_found(page):
+                    log(f"  ⚠️  Export page unavailable for {doc_name}")
+                    log_export_page_context(page)
+                    continue
+                
+                last_timeout_stage = "editor-load"
+                page.wait_for_selector("canvas, svg", timeout=10000)
+                page.wait_for_timeout(3000)
+                
+                last_timeout_stage = "menu-trigger"
+                hamburger = page.locator('[data-test-id="header-hamburger-menu"] [data-test-id="menu-trigger-button"]')
+                hamburger.wait_for(state="visible", timeout=12000)
+                hamburger.click(timeout=10000)
+                page.wait_for_timeout(2000)
+                
+                try:
+                    download_menu = page.locator("text=/Download|Export/i").first
+                    if download_menu.is_visible(timeout=2000):
+                        log(f"  → Found Download/Export menu")
+                        download_menu.click(timeout=5000)
+                        page.wait_for_timeout(1500)
+                except Exception:
+                    log(f"  → Looking for Visio option directly...")
+                
+                last_timeout_stage = "visio-option"
+                visio_option = page.locator("text=/Visio.*VSDX|VSDX.*Visio|Visio \\(VSDX\\)/i").first
+                visio_option.wait_for(state="visible", timeout=10000)
+                
+                log(f"  → Clicking Visio export...")
+                
+                last_timeout_stage = "download"
+                with page.expect_download(timeout=60000) as download_info:
+                    visio_option.click(timeout=5000)
+                    page.wait_for_timeout(2000)
+                
+                download = download_info.value
+                download.save_as(output_path)
+                
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    file_size = os.path.getsize(output_path)
+                    log(f"  ✅ Exported: {doc_name} ({file_size:,} bytes)")
+                    return True
+                
+                log(f"  ❌ File not saved: {doc_name}")
+                return False
+            except PlaywrightTimeout:
+                log(f"  ⚠️  Timeout during {last_timeout_stage} for {doc_name}")
+                log_export_page_context(page)
+                if page_looks_not_found(page):
+                    log(f"  ⚠️  Export page appears unavailable for {doc_name}")
+                continue
         
-        # Look for Download/Export submenu
-        try:
-            download_menu = page.locator("text=/Download|Export/i").first
-            if download_menu.is_visible(timeout=2000):
-                log(f"  → Found Download/Export menu")
-                download_menu.click(timeout=5000)
-                page.wait_for_timeout(1500)
-        except:
-            log(f"  → Looking for Visio option directly...")
-        
-        # Click Visio option
-        visio_option = page.locator("text=/Visio.*VSDX|VSDX.*Visio|Visio \\(VSDX\\)/i").first
-        visio_option.wait_for(state="visible", timeout=10000)
-        
-        log(f"  → Clicking Visio export...")
-        
-        # Click and wait for download
-        with page.expect_download(timeout=60000) as download_info:
-            visio_option.click(timeout=5000)
-            page.wait_for_timeout(2000)
-        
-        download = download_info.value
-        
-        # Save file
-        download.save_as(output_path)
-        
-        # Verify file
-        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-            file_size = os.path.getsize(output_path)
-            log(f"  ✅ Exported: {doc_name} ({file_size:,} bytes)")
-            return True
-        else:
-            log(f"  ❌ File not saved: {doc_name}")
-            return False
-            
-    except PlaywrightTimeout as e:
+        log(f"  ⏱️  Timeout: {doc_name}")
+        return False
+             
+    except PlaywrightTimeout:
         log(f"  ⏱️  Timeout: {doc_name}")
         return False
     except Exception as e:
@@ -811,13 +960,15 @@ def get_documents_from_folder_api(folder_id: str, folders_hierarchy=None):
                 if is_in_folder:
                     doc_id = doc.get("id")
                     doc_title = doc.get("title", "Untitled")
-                    product = doc.get("product", "lucidchart")
+                    product = normalize_product(doc.get("product", "lucidchart"))
                     
                     if product == "lucidchart":
                         documents.append({
                             "id": doc_id,
                             "name": sanitize_filename(doc_title),
-                            "folder_path": folder_path
+                            "folder_path": folder_path,
+                            "product": product,
+                            "edit_url": doc.get("editUrl") or doc.get("editorUrl") or doc.get("url")
                         })
             
             page += 1
